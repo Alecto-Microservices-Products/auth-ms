@@ -1,63 +1,78 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { RpcException } from '@nestjs/microservices';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 
+import { PrismaClient } from '@prisma/client';
 import { LoginUserDto, RegisterUserDto } from './dto';
-import { Usuario, UsuarioDocument } from './schemas/usuario.schema';
-import { Model } from 'mongoose';
-import { InjectModel } from '@nestjs/mongoose';
-
+import { RpcException } from '@nestjs/microservices';
 import * as bcrypt from 'bcrypt';
 import { JwtService } from '@nestjs/jwt';
 import { JwtPayload } from './interfaces/jwt-payload.interface';
+import { envs } from 'src/config';
 
 @Injectable()
-export class AuthService {
+export class AuthService extends PrismaClient implements OnModuleInit {
   private readonly logger = new Logger('AuthService');
 
-  constructor(
-    @InjectModel(Usuario.name)
-    private readonly usuarioModule: Model<UsuarioDocument>,
-    private readonly jwtService: JwtService,
-  ) {}
+  onModuleInit() {
+    this.$connect();
+    this.logger.log('Connected to MongoDb');
+  }
+
+  constructor(private readonly jwtService: JwtService) {
+    super();
+  }
 
   async signJWT(payload: JwtPayload) {
     return this.jwtService.sign(payload);
   }
 
-  async registerUser(registerUserDto: RegisterUserDto) {
-    const { email, name, password } = registerUserDto;
+  async verifyToken(token: string) {
     try {
-      const existingUser = await this.usuarioModule.findOne({ email });
-
-      if (existingUser) {
-        throw new RpcException({
-          status: 400,
-          message: 'Usuario ya existente',
-        });
-      }
-
-      const hashedPassword = bcrypt.hashSync(password, 10);
-      const newUser = await this.usuarioModule.create({
-        email,
-        password: hashedPassword,
-        name,
-      });
-
-      const { _id } = newUser;
-
-      const token = await this.signJWT({
-        email,
-        name,
-        id: _id.toString(),
+      const { sub, iat, exp, ...user } = this.jwtService.verify(token, {
+        secret: envs.jwtSecret,
       });
 
       return {
-        user: {
-          _id,
-          name,
-          email,
+        user,
+        token: await this.signJWT(user),
+      };
+    } catch (error) {
+      throw new RpcException({
+        status: 401,
+        message: 'Token invalido',
+      });
+    }
+  }
+
+  async registerUser(registerUserDto: RegisterUserDto) {
+    const { email, name, password } = registerUserDto;
+
+    try {
+      const user = await this.user.findUnique({
+        where: {
+          email: email,
         },
-        token,
+      });
+
+      if (user) {
+        throw new RpcException({
+          status: 400,
+          message: 'Usuario ya existe',
+        });
+      }
+
+      const newUser = await this.user.create({
+        data: {
+          email,
+          name,
+          password: bcrypt.hashSync(password, 10),
+        },
+      });
+
+      const { password: _, ...res } = newUser;
+
+      return {
+        user: res,
+        token: await this.signJWT(res),
       };
     } catch (error) {
       throw new RpcException({
@@ -70,16 +85,20 @@ export class AuthService {
   async loginUser(loginUserDto: LoginUserDto) {
     const { email, password } = loginUserDto;
     try {
-      const usuario = await this.usuarioModule.findOne({ email });
+      const user = await this.user.findUnique({
+        where: {
+          email: email,
+        },
+      });
 
-      if (!usuario) {
+      if (!user) {
         throw new RpcException({
           status: 400,
           message: 'Usuario no existe',
         });
       }
 
-      const isPasswordValid = bcrypt.compareSync(password, usuario.password);
+      const isPasswordValid = bcrypt.compareSync(password, user.password);
 
       if (!isPasswordValid) {
         throw new RpcException({
@@ -88,21 +107,11 @@ export class AuthService {
         });
       }
 
-      const { _id, name } = usuario;
-
-      const token = await this.signJWT({
-        email,
-        name,
-        id: _id.toString(),
-      });
+      const { password: _, ...res } = user;
 
       return {
-        user: {
-          _id,
-          name,
-          email,
-        },
-        token: token,
+        user: res,
+        token: await this.signJWT(res),
       };
     } catch (error) {
       throw new RpcException({
